@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from models.classifier import BinaryClassifier
-from utils.dataset import build_dataloaders
+from utils.dataset import build_packet_dataloaders
 from utils.preprocessing import flatten_for_surrogate
 
 
@@ -71,7 +71,8 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"Using device: {device}")
 
-    train_loader, test_loader = build_dataloaders(
+    # build_packet_dataloaders splits at flow level then explodes to packets
+    train_loader, test_loader = build_packet_dataloaders(
         args.data_dir, batch_size=args.batch_size
     )
 
@@ -86,8 +87,9 @@ def train(args: argparse.Namespace) -> None:
         # --- training pass ---
         model.train()
         train_loss = 0.0
-        for images, labels in train_loader:
-            feats  = flatten_for_surrogate(images.to(device))
+        for pkts, labels in train_loader:
+            # pkts: (batch, 1501) raw packet bytes
+            feats  = flatten_for_surrogate(pkts.to(device))   # (batch, 1481)
             labels = labels.float().unsqueeze(1).to(device)
 
             optimizer.zero_grad()
@@ -105,8 +107,8 @@ def train(args: argparse.Namespace) -> None:
         correct = 0
         total = 0
         with torch.no_grad():
-            for images, labels in test_loader:
-                feats  = flatten_for_surrogate(images.to(device))
+            for pkts, labels in test_loader:
+                feats  = flatten_for_surrogate(pkts.to(device))   # (batch, 1481)
                 labels = labels.float().unsqueeze(1).to(device)
                 preds = model(feats)
                 test_loss += criterion(preds, labels).item()

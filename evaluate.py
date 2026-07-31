@@ -24,7 +24,7 @@ from models.classifier import BinaryClassifier
 from models.generator import Generator
 from attack.masks import build_perturbation_mask
 from utils.dataset import build_dataloaders
-from utils.preprocessing import flatten_for_surrogate
+from utils.preprocessing import flow_surrogate_prediction
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,9 +112,8 @@ def main(args: argparse.Namespace) -> None:
             labels = labels.float().unsqueeze(1).to(device)
             batch_size = images.size(0)
 
-            # --- clean predictions ---
-            feat_clean = flatten_for_surrogate(images)
-            clean_preds = classifier(feat_clean)
+            # --- clean predictions (mean over valid packets per flow) ---
+            clean_preds = flow_surrogate_prediction(classifier, images)
             clean_pred_labels = (clean_preds >= 0.5).int()
             label_ints = labels.int()
             correctly_classified = (clean_pred_labels == label_ints)   # bool mask
@@ -130,9 +129,8 @@ def main(args: argparse.Namespace) -> None:
                 [perturbed_red, images[:, 1:3, :, :]], dim=1
             )
 
-            # --- adversarial predictions ---
-            feat_adv = flatten_for_surrogate(adv_images)
-            adv_preds = classifier(feat_adv)
+            # --- adversarial predictions (mean over valid packets per flow) ---
+            adv_preds = flow_surrogate_prediction(classifier, adv_images)
             adv_pred_labels = (adv_preds >= 0.5).int()
 
             # --- accumulate counters ---

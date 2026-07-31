@@ -28,7 +28,7 @@ import torch.nn as nn
 
 from models.generator import Generator
 from attack.masks import build_perturbation_mask
-from utils.preprocessing import extract_classifier_channels, flatten_for_surrogate
+from utils.preprocessing import extract_classifier_channels, flow_surrogate_prediction
 
 
 class AdvGAN:
@@ -91,9 +91,8 @@ class AdvGAN:
         """
         batch_size = imagereal.shape[0]
 
-        # --- build surrogate-ready flat features ---
-        image_real_real = extract_classifier_channels(imagereal)  # kept for adv reconstruction
-        feat_real = flatten_for_surrogate(imagereal)               # (batch, 1481) → surrogate
+        # --- strip header bytes for adversarial image reconstruction ---
+        image_real_real = extract_classifier_channels(imagereal)
 
         # --- build perturbation mask (only mutable byte positions) ---
         mask = build_perturbation_mask(n_packets=15, n_bytes=1501).to(self.device)
@@ -125,11 +124,11 @@ class AdvGAN:
         )
 
         y_true = torch.zeros(batch_size, 1, device=self.device)
-        feat_adv = flatten_for_surrogate(
-            torch.cat([adv_image[:, 0:1, :, :], imagereal[:, 1:3, :, :]], dim=1)
-        )
-        y_pred = self.target_model(feat_adv)
-        y_pred_before = self.target_model(feat_real)
+        # Surrogate is packet-based: average its prediction across all valid
+        # packet rows in the flow to obtain a flow-level score.
+        adv_flow  = torch.cat([adv_image[:, 0:1, :, :], imagereal[:, 1:3, :, :]], dim=1)
+        y_pred        = flow_surrogate_prediction(self.target_model, adv_flow)
+        y_pred_before = flow_surrogate_prediction(self.target_model, imagereal)
 
         loss_adv = self._loss_fn(y_pred, y_true)
 
