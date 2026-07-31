@@ -1,6 +1,6 @@
 # Adversarial Traffic Attack
 
-A PyTorch implementation of an **AdvGAN-based adversarial attack** against a surrogate MLP classifier trained on raw network-flow packet data.
+A PyTorch implementation of an **PerturbLite** against a surrogate MLP classifier trained on raw network-flow packet data.
 
 The project demonstrates that small, targeted perturbations applied to specific mutable header fields (IP TTL, TCP urgent pointer) can reliably fool a deep learning intrusion-detection model while keeping modified packets structurally valid.
 
