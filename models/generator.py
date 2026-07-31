@@ -71,22 +71,13 @@ class Generator(nn.Module):
 
         Parameters
         ----------
-        x : Tensor  ``(batch, 1, n_packets, n_bytes)``
+        x : Tensor  ``(batch, 1, n_features)``
+            Single packet as a 1-D sequence (1 channel, n_features values).
 
         Returns
         -------
-        Tensor  ``(batch, 1, n_packets, n_bytes)``
-            Per-byte perturbation values in ``[0, 1]``.
+        Tensor  ``(batch, 1, n_features)``
+            Per-feature perturbation values in ``[0, 1]``.
         """
-        batch, channels, n_packets, n_bytes = x.shape
-
-        # Flatten packet dimension into the batch for 1-D convolutions
-        # (batch, 1, n_packets, n_bytes) → (batch * n_packets, 1, n_bytes)
-        x_1d = x.permute(0, 2, 1, 3).reshape(batch * n_packets, channels, n_bytes)
-
-        x_1d = self.encoder(x_1d)
-        x_1d = self.decoder(x_1d)
-
-        # Restore original shape
-        # (batch * n_packets, 1, n_bytes) → (batch, 1, n_packets, n_bytes)
-        return x_1d.reshape(batch, n_packets, channels, n_bytes).permute(0, 2, 1, 3)
+        x = self.encoder(x)
+        return self.decoder(x)

@@ -30,12 +30,10 @@ The project demonstrates that small, targeted perturbations applied to specific 
 | `AdvGAN` | Adversarial training loop that minimises BCE loss of the *perturbed* flow's classification via the surrogate |
 | Checksum utilities | RFC 791 / RFC 793 implementations to repair IP/TCP checksums after perturbation |
 
-**Input representation**: the dataset stores one flow per image file in shape `(3, 15, 1501)`:
-- **3 channels**: forward direction / backward direction / combined flow
-- **15 rows**: up to 15 packets per flow
-- **1501 columns**: raw byte values (0–255) per packet
-
-The **surrogate classifier is packet-based**: each non-zero packet row is treated as an independent sample with 1481 features (after stripping immutable header bytes). The **Generator** operates on the full flow image and perturbs all packet rows simultaneously.
+***Input representation**: the data is **packet-based** — each sample is one packet
+represented as a pre-extracted **1481-feature** vector (CSV row). The data generation
+pipeline strips immutable header bytes (IP/TCP checksums, sequence numbers) before
+saving. Labels (0 = benign, 1 = malicious) are included as a column in the same CSV.
 
 ---
 
@@ -69,13 +67,16 @@ adversarial-traffic-attack/
 
 See [data/README.md](data/README.md) for the full specification.
 
-Each flow image is a PNG/BMP file with pixel values representing raw byte values (0–255) of network packets. Images are organised into class sub-folders:
+A single CSV file where each row is one packet:
 
 ```
-data/
-  0/   ← benign flows
-  1/   ← malicious / attack flows
+feat_0, feat_1, ..., feat_1480, label
+0.12,   0.00,   ..., 0.87,      0
+0.45,   0.11,   ..., 0.23,      1
 ```
+
+- **1481 columns**: pre-extracted feature values (immutable header bytes already stripped)
+- **label column**: 0 = benign, 1 = malicious
 
 ---
 
@@ -104,7 +105,7 @@ python train_classifier.py \
     --save-path best_classifier.pth
 ```
 
-The script extracts a flat **1481-feature** vector from each individual packet via `flatten_for_surrogate`, splits data 90/10 at the **flow level** before exploding to packets (so no flow leaks across splits), reports per-epoch loss and accuracy, and saves the best checkpoint to `--save-path`.
+The script loads the CSV via `build_packet_dataloaders`, splits 90/10 into train/test (stratified), trains the surrogate on 1481-feature packet vectors, and saves the best checkpoint.
 
 ### 2. Train the Attack Generator
 
@@ -174,7 +175,7 @@ Each packet row is processed independently as a 1-D byte sequence; the forward p
 
 - **Mutable-only perturbation**: the mask restricts changes to columns 9 (TTL), 35, and 36 (TCP urgent pointer / options), leaving routing-critical fields intact.
 - **Multiplicative application**: `perturbed = G(x) * mask * x + x` scales the perturbation relative to each byte's value.
-- **Flat surrogate input**: each packet is stripped to 1481 features by `flatten_for_surrogate` (drops checksums and per-connection identifiers). Flows are exploded into individual packet samples for surrogate training via `PacketDataset`.
-- **Flow-level attack evaluation**: the surrogate predicts each packet in a perturbed flow independently; `flow_surrogate_prediction` averages those scores to produce a single flow-level classification for the ASR computation.
+- **CSV packet data**: each row in the CSV is one packet. Features are pre-extracted by the data generation pipeline; no runtime byte-stripping is needed.
+- **Flat surrogate input**: the surrogate receives 1481-feature vectors directly from the CSV. Mutable positions (feature indices 7, 17, 18 → IP TTL, TCP urgent pointer) are masked for perturbation.
 - **Discriminator disabled**: the adversarial (GAN) discriminator loss is commented out in the default configuration; only the adversarial BCE loss from the frozen surrogate is used.
 - **Checksum repair**: `utils/checksum.py` provides RFC 791/793 checksum functions for post-hoc validity correction of perturbed packets.

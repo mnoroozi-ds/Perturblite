@@ -17,7 +17,7 @@ import torch
 
 from models.classifier import BinaryClassifier
 from attack.adv_gan import AdvGAN
-from utils.dataset import build_dataloaders
+from utils.dataset import build_packet_dataloaders
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,7 +95,7 @@ def main(args: argparse.Namespace) -> None:
     print(f"Loaded classifier from {args.classifier_path}")
 
     # Data
-    train_loader, _ = build_dataloaders(args.data_dir, batch_size=args.batch_size)
+    train_loader, _ = build_packet_dataloaders(args.data_dir, batch_size=args.batch_size)
 
     # Attack
     attacker = AdvGAN(

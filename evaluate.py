@@ -23,8 +23,7 @@ import torch
 from models.classifier import BinaryClassifier
 from models.generator import Generator
 from attack.masks import build_perturbation_mask
-from utils.dataset import build_dataloaders
-from utils.preprocessing import flow_surrogate_prediction
+from utils.dataset import build_packet_dataloaders
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,10 +82,10 @@ def main(args: argparse.Namespace) -> None:
     print(f"Loaded generator   : {args.generator_path}")
 
     # Data — use test split
-    _, test_loader = build_dataloaders(args.data_dir, batch_size=args.batch_size)
+    _, test_loader = build_packet_dataloaders(args.data_dir, batch_size=args.batch_size)
 
-    # Perturbation mask
-    mask = build_perturbation_mask(n_packets=15, n_bytes=1501).to(device)
+    # Perturbation mask  (1-D, shape: n_features)
+    mask = build_perturbation_mask().to(device)
 
     # Evaluation loop
     #
@@ -107,30 +106,24 @@ def main(args: argparse.Namespace) -> None:
     adv_correct = 0  # correctly classified on adversarial input (for reporting)
 
     with torch.no_grad():
-        for images, labels in test_loader:
-            images = images.to(device)
+        for pkts, labels in test_loader:
+            pkts   = pkts.to(device)                         # (batch, 1481)
             labels = labels.float().unsqueeze(1).to(device)
-            batch_size = images.size(0)
+            batch_size = pkts.size(0)
 
-            # --- clean predictions (mean over valid packets per flow) ---
-            clean_preds = flow_surrogate_prediction(classifier, images)
+            # --- clean predictions (packet-level) ---
+            clean_preds = classifier(pkts)
             clean_pred_labels = (clean_preds >= 0.5).int()
             label_ints = labels.int()
             correctly_classified = (clean_pred_labels == label_ints)   # bool mask
 
             # --- generate adversarial perturbation ---
-            channel_red = images[:, 0:1, :, :]
-            perturbation = generator(channel_red)
-            expanded_mask = mask.unsqueeze(0).expand(batch_size, -1, -1).unsqueeze(1)
-            perturbation = perturbation * expanded_mask
-            perturbed_red = (perturbation * channel_red + channel_red).clamp(0, 1)
+            perturbation = generator(pkts.unsqueeze(1)).squeeze(1)  # (batch, 1481)
+            perturbation = perturbation * mask
+            perturbed    = (perturbation * pkts + pkts).clamp(0.0, 1.0)
 
-            adv_images = torch.cat(
-                [perturbed_red, images[:, 1:3, :, :]], dim=1
-            )
-
-            # --- adversarial predictions (mean over valid packets per flow) ---
-            adv_preds = flow_surrogate_prediction(classifier, adv_images)
+            # --- adversarial predictions (packet-level) ---
+            adv_preds = classifier(perturbed)
             adv_pred_labels = (adv_preds >= 0.5).int()
 
             # --- accumulate counters ---

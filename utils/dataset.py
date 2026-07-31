@@ -1,217 +1,79 @@
-"""Dataset utilities for loading network-flow images.
+"""Dataset utilities for loading per-packet CSV data.
 
-Expected on-disk layout
------------------------
-A root directory with two sub-folders::
+Expected data format
+--------------------
+A single CSV file where:
+  - Each row is one packet
+  - There is one label column (default: ``'label'``) containing 0 (benign)
+    or 1 (malicious)
+  - All remaining columns are the 1481 pre-extracted feature values
+    (header bytes already stripped by the data generation pipeline)
 
-    data/
-      0/   <- benign flow images  (class label 0)
-      1/   <- malicious flow images (class label 1)
+Example structure::
 
-Each image file is a PNG/BMP representation of one network flow:
-  - shape after ``transforms.ToTensor()`` : ``(3, 15, 1501)``
-  - channel 0 = forward direction packets
-  - channel 1 = backward direction packets
-  - channel 2 = combined / metadata channel
+    feat_0, feat_1, ..., feat_1480, label
+    0.12,   0.00,   ..., 0.87,      0
+    0.45,   0.11,   ..., 0.23,      1
+    ...
 
-Two dataset classes are provided
----------------------------------
-``FlowImageDataset``
-    One sample = one complete flow image ``(3, 15, 1501)``.  Used by the
-    Generator training loop (AdvGAN) which needs the full 2-D flow.
-
-``PacketDataset``
-    One sample = one **packet** (a single non-zero row from channel 0),
-    represented as a raw ``(1501,)`` byte vector.  Used for training and
-    evaluating the surrogate classifier, since the paper is packet-based.
+The train/test split is performed at load time using scikit-learn's
+``train_test_split``.
 """
 
 import os
-from typing import Optional
 
+import pandas as pd
 import torch
-from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
-
-
-_DEFAULT_TRANSFORM = transforms.Compose([transforms.ToTensor()])
-
-
-class FlowImageDataset(Dataset):
-    """Dataset that wraps a list of ``(tensor, label)`` pairs.
-
-    This is used after loading images from disk so that both the training
-    and test sets can share the same ``DataLoader`` interface.
-
-    Parameters
-    ----------
-    samples : list of [Tensor, Tensor]
-        Each element is ``[image_tensor, label_tensor]`` as produced by
-        :func:`load_samples_from_folder`.
-    """
-
-    def __init__(self, samples: list):
-        self.samples = samples
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, index: int):
-        return self.samples[index]
 
 
 class PacketDataset(Dataset):
-    """Packet-level dataset: each non-zero packet row is an independent sample.
+    """Packet-level dataset backed by a pandas DataFrame.
 
-    Iterates over a list of flow image samples (as produced by
-    :func:`load_samples_from_folder`) and extracts every non-zero packet row
-    from the forward channel (channel 0).  Zero-padded rows (absent packets)
-    are skipped.  The label from the parent flow is inherited by each packet.
+    Each item is ``(features, label)`` where features is a float32
+    Tensor of shape ``(n_features,)`` and label is a scalar int64 Tensor.
 
     Parameters
     ----------
-    flow_samples : list of [Tensor (3, 15, 1501), Tensor (scalar)]
-        Flow-level samples as produced by :func:`load_samples_from_folder`.
+    features : pd.DataFrame or np.ndarray  shape (N, n_features)
+    labels   : pd.Series or np.ndarray     shape (N,)
     """
 
-    def __init__(self, flow_samples: list):
-        self.packets: list = []
-        for img_tensor, label in flow_samples:
-            # img_tensor: (3, 15, 1501) — use channel 0 (forward direction)
-            fwd = img_tensor[0]          # (15, 1501)
-            for row in range(fwd.shape[0]):
-                pkt = fwd[row]           # (1501,)
-                if pkt.abs().sum() > 0:  # skip zero-padded (absent) rows
-                    self.packets.append((pkt, label))
+    def __init__(self, features, labels):
+        self.X = torch.tensor(features.values if hasattr(features, 'values') else features,
+                              dtype=torch.float32)
+        self.y = torch.tensor(labels.values   if hasattr(labels,   'values') else labels,
+                              dtype=torch.long)
 
     def __len__(self) -> int:
-        return len(self.packets)
+        return len(self.y)
 
     def __getitem__(self, index: int):
-        return self.packets[index]
-
-
-def load_samples_from_folder(
-    folder: str,
-    label: int,
-    transform=None,
-) -> list:
-    """Load all image files in *folder* and assign *label* to each.
-
-    Parameters
-    ----------
-    folder : str
-        Directory containing image files (PNG / BMP / JPG).
-    label : int
-        Integer class label (0 = benign, 1 = malicious).
-    transform : callable, optional
-        Torchvision transform to apply; defaults to ``transforms.ToTensor()``.
-
-    Returns
-    -------
-    list of [Tensor, Tensor]
-        Each element is ``[image_tensor, torch.tensor(label)]``.
-    """
-    if transform is None:
-        transform = _DEFAULT_TRANSFORM
-
-    samples = []
-    for filename in sorted(os.listdir(folder)):
-        file_path = os.path.join(folder, filename)
-        try:
-            img = Image.open(file_path).convert("RGB")
-            samples.append([transform(img), torch.tensor(label)])
-        except (OSError, Exception):
-            # Skip unreadable files silently
-            continue
-    return samples
-
-
-def build_dataloaders(
-    data_dir: str,
-    batch_size: int = 32,
-    test_size: float = 0.1,
-    random_state: int = 42,
-    num_workers: int = 0,
-) -> tuple[DataLoader, DataLoader]:
-    """Build train and test DataLoaders from a class-folder data directory.
-
-    The directory must contain ``0/`` and ``1/`` sub-folders holding the
-    benign and malicious flow images respectively.  The combined set is
-    split into train / test using *test_size*.
-
-    Parameters
-    ----------
-    data_dir : str
-        Root directory with sub-folders ``0`` and ``1``.
-    batch_size : int
-        Mini-batch size for both loaders.
-    test_size : float
-        Fraction of data reserved for the test set (e.g. 0.1 = 10%).
-    random_state : int
-        Seed for reproducible train/test splitting.
-    num_workers : int
-        Number of worker processes for DataLoader.
-
-    Returns
-    -------
-    train_loader, test_loader : DataLoader, DataLoader
-    """
-    all_samples: list = []
-    for label in (0, 1):
-        folder = os.path.join(data_dir, str(label))
-        if not os.path.isdir(folder):
-            raise FileNotFoundError(
-                f"Expected class folder not found: {folder}"
-            )
-        all_samples.extend(load_samples_from_folder(folder, label))
-
-    train_list, test_list = train_test_split(
-        all_samples, test_size=test_size, random_state=random_state
-    )
-    print(f"Train samples: {len(train_list)} | Test samples: {len(test_list)}")
-
-    train_loader = DataLoader(
-        FlowImageDataset(train_list),
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-    )
-    test_loader = DataLoader(
-        FlowImageDataset(test_list),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
-    return train_loader, test_loader
+        return self.X[index], self.y[index]
 
 
 def build_packet_dataloaders(
-    data_dir: str,
+    csv_path: str,
+    label_col: str = 'label',
     batch_size: int = 32,
     test_size: float = 0.1,
     random_state: int = 42,
     num_workers: int = 0,
 ) -> tuple[DataLoader, DataLoader]:
-    """Build packet-level train and test DataLoaders.
-
-    Identical to :func:`build_dataloaders` but uses :class:`PacketDataset`
-    so each batch contains individual packets ``(batch, 1501)`` rather than
-    full flow images.  Use this for training and evaluating the surrogate.
-
-    The train/test split is performed at the **flow level** before exploding
-    into packets, so packets from the same flow never appear in both splits.
+    """Build train and test DataLoaders from a per-packet CSV file.
 
     Parameters
     ----------
-    data_dir : str
-        Root directory with sub-folders ``0`` and ``1``.
+    csv_path : str
+        Path to the CSV file.  Must contain *label_col* plus 1481 feature
+        columns.
+    label_col : str
+        Name of the label column (default: ``'label'``).
     batch_size : int
         Mini-batch size for both loaders.
     test_size : float
-        Fraction of *flows* reserved for the test set.
+        Fraction of packets reserved for the test set.
     random_state : int
         Seed for reproducible splitting.
     num_workers : int
@@ -221,30 +83,46 @@ def build_packet_dataloaders(
     -------
     train_loader, test_loader : DataLoader, DataLoader
     """
-    all_samples: list = []
-    for label in (0, 1):
-        folder = os.path.join(data_dir, str(label))
-        if not os.path.isdir(folder):
-            raise FileNotFoundError(
-                f"Expected class folder not found: {folder}"
-            )
-        all_samples.extend(load_samples_from_folder(folder, label))
+    df = pd.read_csv(csv_path)
 
-    train_list, test_list = train_test_split(
-        all_samples, test_size=test_size, random_state=random_state
+    if label_col not in df.columns:
+        raise ValueError(f"Label column '{label_col}' not found in {csv_path}")
+
+    X = df.drop(columns=[label_col])
+    y = df[label_col]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y
     )
 
-    train_pkt = PacketDataset(train_list)
-    test_pkt  = PacketDataset(test_list)
     print(
-        f"Flows  — train: {len(train_list)} | test: {len(test_list)}\n"
-        f"Packets — train: {len(train_pkt)} | test: {len(test_pkt)}"
+        f"Packets — train: {len(X_train)} | test: {len(X_test)} | "
+        f"features: {X_train.shape[1]}"
     )
 
     train_loader = DataLoader(
-        train_pkt, batch_size=batch_size, shuffle=True,  num_workers=num_workers
+        PacketDataset(X_train, y_train),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
     )
     test_loader = DataLoader(
-        test_pkt,  batch_size=batch_size, shuffle=False, num_workers=num_workers
+        PacketDataset(X_test, y_test),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
     )
     return train_loader, test_loader
+
+
+# ---------------------------------------------------------------------------
+# Alias kept for the AdvGAN training loop (uses flow images from disk)
+# ---------------------------------------------------------------------------
+build_dataloaders = build_packet_dataloaders
+
+import os
+
+import pandas as pd
+import torch
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset

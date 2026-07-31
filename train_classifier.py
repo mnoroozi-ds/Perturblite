@@ -22,7 +22,6 @@ import torch.optim as optim
 
 from models.classifier import BinaryClassifier
 from utils.dataset import build_packet_dataloaders
-from utils.preprocessing import flatten_for_surrogate
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,7 +74,6 @@ def train(args: argparse.Namespace) -> None:
     train_loader, test_loader = build_packet_dataloaders(
         args.data_dir, batch_size=args.batch_size
     )
-
     model = BinaryClassifier().to(device)
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -88,8 +86,8 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         train_loss = 0.0
         for pkts, labels in train_loader:
-            # pkts: (batch, 1501) raw packet bytes
-            feats  = flatten_for_surrogate(pkts.to(device))   # (batch, 1481)
+            # pkts: (batch, 1481) pre-extracted features
+            feats  = pkts.to(device)
             labels = labels.float().unsqueeze(1).to(device)
 
             optimizer.zero_grad()
@@ -108,7 +106,7 @@ def train(args: argparse.Namespace) -> None:
         total = 0
         with torch.no_grad():
             for pkts, labels in test_loader:
-                feats  = flatten_for_surrogate(pkts.to(device))   # (batch, 1481)
+                feats  = pkts.to(device)   # (batch, 1481) already extracted
                 labels = labels.float().unsqueeze(1).to(device)
                 preds = model(feats)
                 test_loss += criterion(preds, labels).item()

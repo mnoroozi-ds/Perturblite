@@ -1,20 +1,17 @@
-"""AdvGAN adversarial attack against a network-flow binary classifier.
+"""AdvGAN adversarial attack against a packet-level surrogate classifier.
 
 The attack trains a Generator (G) to produce small perturbations on
-network-flow packet images that fool the target classifier into predicting
+individual packet feature vectors that fool the surrogate into predicting
 the wrong class, while keeping the perturbation magnitude small.
 
 Key design choices
 ------------------
-- Only *mutable* packet byte positions are perturbed (controlled by a mask
-  defined in :mod:`attack.masks`).  Immutable fields (e.g. IP/TCP source
-  port, sequence numbers) are left unchanged.
-- Perturbation is applied multiplicatively: ``perturbed = G(x) * mask * x + x``
-  This scales the perturbation relative to the original byte value, producing
-  more realistic modifications.
-- Loss = ``adv_lambda * BCE(classifier(perturbed), 0) + pert_lambda * L2(G(x))``
-  The adversarial term drives misclassification; the perturbation term limits
-  the size of the change.
+- Input is a pre-extracted 1481-feature packet vector (CSV row) — no
+  image manipulation is required.
+- Only *mutable* feature positions are perturbed (controlled by the mask
+  in :mod:`attack.masks`).  Immutable fields are left unchanged.
+- Perturbation applied multiplicatively: ``perturbed = G(x) * mask * x + x``
+- Loss = ``adv_lambda * BCE(surrogate(perturbed), 0) + pert_lambda * L2(G(x))``
 
 Usage
 -----
@@ -28,7 +25,6 @@ import torch.nn as nn
 
 from models.generator import Generator
 from attack.masks import build_perturbation_mask
-from utils.preprocessing import extract_classifier_channels, flow_surrogate_prediction
 
 
 class AdvGAN:
@@ -71,68 +67,43 @@ class AdvGAN:
     # Training
     # ------------------------------------------------------------------
 
-    def train_batch(self, x: torch.Tensor, imagereal: torch.Tensor, epoch: int):
+    def train_batch(self, x: torch.Tensor, labels: torch.Tensor):
         """Run one optimisation step on a single mini-batch.
 
         Parameters
         ----------
-        x : Tensor  (batch, 1, 15, W)
-            Single-channel (red) slice of the flow image — input to G.
-        imagereal : Tensor  (batch, 3, 15, 1501)
-            Full 3-channel flow image — used to build the classifier input.
-        epoch : int
-            Current epoch number (used for debug logging).
+        x : Tensor  (batch, 1481)
+            Pre-extracted packet features (CSV row, normalised to [0, 1]).
+        labels : Tensor  (batch,)
+            Ground-truth class labels (unused in loss, kept for signature
+            consistency).
 
         Returns
         -------
         tuple of floats
             ``(loss_perturb, loss_adv, gain)`` where *gain* is the number
-            of samples that flipped from predicted-class-1 to predicted-class-0.
+            of packets that flipped from predicted-class-1 to predicted-class-0.
         """
-        batch_size = imagereal.shape[0]
+        batch_size = x.shape[0]
+        mask = build_perturbation_mask(n_features=x.shape[1]).to(self.device)
 
-        # --- strip header bytes for adversarial image reconstruction ---
-        image_real_real = extract_classifier_channels(imagereal)
+        # Generator expects (batch, 1, n_features)
+        perturbation = self.G(x.unsqueeze(1)).squeeze(1)   # (batch, 1481)
+        perturbation = perturbation * mask
+        perturbed    = (perturbation * x + x).clamp(0.0, 1.0)
 
-        # --- build perturbation mask (only mutable byte positions) ---
-        mask = build_perturbation_mask(n_packets=15, n_bytes=1501).to(self.device)
-        expanded_mask = mask.unsqueeze(0).expand(batch_size, -1, -1).unsqueeze(1)
-
-        # --- generate & apply perturbation ---
-        perturbation = self.G(x)
-        perturbation = perturbation * expanded_mask
-        perturbed = perturbation * x + x
-
-        # --- rebuild 3-channel adversarial image for the classifier ---
-        red = extract_classifier_channels(
-            torch.cat([
-                perturbed,
-                imagereal[:, 1:3, :, :],
-            ], dim=1)
-        )
-        red = torch.clamp(red, 0.0, 1.0)
-
-        green = image_real_real[:, 1, :, :].unsqueeze(1)
-        blue  = image_real_real[:, 2, :, :].unsqueeze(1)
-        adv_image = torch.cat([red, green, blue], dim=1)
-
-        # --- Generator loss ---
         self.optimizer_G.zero_grad()
 
         loss_perturb = torch.mean(
-            torch.norm(perturbation.view(batch_size, -1), p=2, dim=1)
+            torch.norm(perturbation, p=2, dim=1)
         )
 
-        y_true = torch.zeros(batch_size, 1, device=self.device)
-        # Surrogate is packet-based: average its prediction across all valid
-        # packet rows in the flow to obtain a flow-level score.
-        adv_flow  = torch.cat([adv_image[:, 0:1, :, :], imagereal[:, 1:3, :, :]], dim=1)
-        y_pred        = flow_surrogate_prediction(self.target_model, adv_flow)
-        y_pred_before = flow_surrogate_prediction(self.target_model, imagereal)
+        y_true        = torch.zeros(batch_size, 1, device=self.device)
+        y_pred        = self.target_model(perturbed)
+        y_pred_before = self.target_model(x)
 
         loss_adv = self._loss_fn(y_pred, y_true)
 
-        # count samples that flipped toward the target class
         gain = torch.sum(
             (y_pred < 0.5).int() > (y_pred_before < 0.5).int()
         ).item()
@@ -153,7 +124,7 @@ class AdvGAN:
         Parameters
         ----------
         train_dataloader : DataLoader
-            Yields ``(images, labels)`` batches; images shape (B, 3, 15, 1501).
+            Yields ``(pkts, labels)`` batches; pkts shape ``(B, 1481)``.
         epochs : int
             Number of full passes over the training set.
         checkpoint_every : int
@@ -167,12 +138,11 @@ class AdvGAN:
             loss_adv_sum = 0.0
             gain_sum = 0
 
-            for images, labels in train_dataloader:
+            for pkts, labels in train_dataloader:
                 torch.cuda.empty_cache()
-                images = images.to(self.device)
-                # red channel only → input to G
-                channel_red = images[:, 0:1, :, :]
-                lp, la, gain = self.train_batch(channel_red, images, epoch)
+                pkts   = pkts.to(self.device)
+                labels = labels.to(self.device)
+                lp, la, gain = self.train_batch(pkts, labels)
                 loss_perturb_sum += lp
                 loss_adv_sum     += la
                 gain_sum         += gain
