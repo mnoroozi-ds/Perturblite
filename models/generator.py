@@ -1,10 +1,10 @@
-"""Generator network for adversarial perturbation of network flow images.
+"""PerturbLite autoencoder for generated packet feature values.
 
 Architecture (1-D convolutional encoder–decoder)
 ------------------------------------------------
-Processes each packet row independently as a 1-D byte sequence.
-The forward pass reshapes ``(batch, 1, n_packets, n_bytes)`` →
-``(batch * n_packets, 1, n_bytes)`` → Conv1d layers → reshape back.
+Processes one 1,481-feature packet as a 1-D byte sequence. The constraint
+module selects generated mutable header values and copies immutable original
+values; this network does not itself apply the masks.
 
 Layer specification
 -------------------
@@ -30,12 +30,7 @@ import torch.nn as nn
 
 
 class Generator(nn.Module):
-    """1-D convolutional encoder–decoder generator.
-
-    Input/output shape: ``(batch, 1, n_packets, n_bytes)``.
-    Each packet row is processed independently through Conv1d layers so the
-    generator is agnostic to the number of packets.
-    """
+    """1-D convolutional encoder-decoder with sigmoid feature output."""
 
     def __init__(self):
         super().__init__()
@@ -77,7 +72,7 @@ class Generator(nn.Module):
         Returns
         -------
         Tensor  ``(batch, 1, n_features)``
-            Per-feature perturbation values in ``[0, 1]``.
+            Proposed feature values in ``[0, 1]``.
         """
         x = self.encoder(x)
         return self.decoder(x)

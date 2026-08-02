@@ -1,20 +1,8 @@
-"""Train the binary network-flow classifier.
+"""Train the PerturbLite surrogate classifier on packet-level CSV data."""
 
-Usage
------
-    python train_classifier.py --data-dir data/ --epochs 1000 --save-path best_classifier.pth
-
-The data directory must have the structure::
-
-    data/
-      0/   <- benign flow images
-      1/   <- malicious flow images
-
-All images are split 90/10 into train/test by default.
-"""
+from __future__ import annotations
 
 import argparse
-import sys
 
 import torch
 import torch.nn as nn
@@ -25,111 +13,118 @@ from utils.dataset import build_packet_dataloaders
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Train the BinaryClassifier on network-flow images."
-    )
-    parser.add_argument(
-        "--data-dir",
-        required=True,
-        help="Root data directory containing sub-folders '0' and '1'.",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=200,
-        help="Number of training epochs (default: 200).",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-        help="Mini-batch size (default: 32).",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-4,
-        help="Learning rate (default: 1e-4).",
-    )
-    parser.add_argument(
-        "--save-path",
-        default="best_classifier.pth",
-        help="Path to save the best model checkpoint (default: best_classifier.pth).",
-    )
-    parser.add_argument(
-        "--device",
-        default=None,
-        help="Compute device: 'cuda', 'cpu', or leave empty for auto-detect.",
-    )
+    parser = argparse.ArgumentParser(description="Train the PerturbLite surrogate DNN.")
+    parser.add_argument("--data", required=True, help="Path to the prepared packet CSV.")
+    parser.add_argument("--label-col", default="label")
+    parser.add_argument("--partition-col", default=None)
+    parser.add_argument("--classifier-fraction", type=float, default=0.5)
+    parser.add_argument("--attack-type-col", default=None)
+    parser.add_argument("--attack-type", default=None)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--fold-index", type=int, default=0)
+    parser.add_argument("--save-path", default="best_classifier.pth")
+    parser.add_argument("--device", default=None)
     return parser.parse_args()
 
 
+@torch.no_grad()
+def evaluate(model, dataloader, criterion, device) -> tuple[float, float]:
+    model.eval()
+    loss_sum = 0.0
+    correct = 0
+    total = 0
+    for packets, labels in dataloader:
+        packets = packets.to(device)
+        labels = labels.float().unsqueeze(1).to(device)
+        predictions = model(packets)
+        batch_size = packets.shape[0]
+        loss_sum += criterion(predictions, labels).item() * batch_size
+        correct += ((predictions >= 0.5) == labels.bool()).sum().item()
+        total += batch_size
+    return loss_sum / max(total, 1), correct / max(total, 1)
+
+
 def train(args: argparse.Namespace) -> None:
+    torch.manual_seed(args.seed)
     device = torch.device(
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     print(f"Using device: {device}")
 
-    # build_packet_dataloaders splits at flow level then explodes to packets
-    train_loader, test_loader = build_packet_dataloaders(
-        args.data_dir, batch_size=args.batch_size
+    loaders = build_packet_dataloaders(
+        args.data,
+        label_col=args.label_col,
+        batch_size=args.batch_size,
+        random_state=args.seed,
+        partition="classifier",
+        partition_col=args.partition_col,
+        classifier_fraction=args.classifier_fraction,
+        folds=args.folds,
+        fold_index=args.fold_index,
+        attack_type_col=args.attack_type_col,
+        attack_type=args.attack_type,
     )
-    model = BinaryClassifier().to(device)
+    model = BinaryClassifier(input_dim=len(loaders.feature_names)).to(device)
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    print(f"Surrogate parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    print(
+        "Surrogate parameters: "
+        f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,}"
+    )
 
     best_loss = float("inf")
-
+    stale_epochs = 0
     for epoch in range(1, args.epochs + 1):
-        # --- training pass ---
         model.train()
         train_loss = 0.0
-        for pkts, labels in train_loader:
-            # pkts: (batch, 1481) pre-extracted features
-            feats  = pkts.to(device)
+        train_count = 0
+        for packets, labels in loaders.train:
+            packets = packets.to(device)
             labels = labels.float().unsqueeze(1).to(device)
-
             optimizer.zero_grad()
-            preds = model(feats)
-            loss = criterion(preds, labels)
+            predictions = model(packets)
+            loss = criterion(predictions, labels)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
+            train_loss += loss.item() * packets.shape[0]
+            train_count += packets.shape[0]
 
-        mean_train_loss = train_loss / len(train_loader)
-
-        # --- evaluation pass ---
-        model.eval()
-        test_loss = 0.0
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for pkts, labels in test_loader:
-                feats  = pkts.to(device)   # (batch, 1481) already extracted
-                labels = labels.float().unsqueeze(1).to(device)
-                preds = model(feats)
-                test_loss += criterion(preds, labels).item()
-                predicted = (preds >= 0.5).int()
-                correct += (predicted == labels.int()).sum().item()
-                total += labels.size(0)
-
-        mean_test_loss = test_loss / len(test_loader)
-        accuracy = correct / total if total > 0 else 0.0
-
+        val_loss, val_accuracy = evaluate(model, loaders.validation, criterion, device)
         print(
-            f"Epoch {epoch}/{args.epochs} | "
-            f"train_loss={mean_train_loss:.4f} | "
-            f"test_loss={mean_test_loss:.4f} | "
-            f"accuracy={accuracy:.4f}"
+            f"Epoch {epoch}/{args.epochs} | train_loss={train_loss / max(train_count, 1):.6f} "
+            f"| val_loss={val_loss:.6f} | val_accuracy={val_accuracy:.4f}"
         )
 
-        if mean_test_loss < best_loss:
-            best_loss = mean_test_loss
-            torch.save(model.state_dict(), args.save_path)
-            print(f"  Saved best model → {args.save_path}")
+        if val_loss < best_loss:
+            best_loss = val_loss
+            stale_epochs = 0
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "feature_names": loaders.feature_names,
+                    "epoch": epoch,
+                    "validation_loss": val_loss,
+                },
+                args.save_path,
+            )
+        else:
+            stale_epochs += 1
+        if args.patience > 0 and stale_epochs >= args.patience:
+            print(f"Early stopping after {epoch} epochs")
+            break
 
-    print(f"Training complete. Best test loss: {best_loss:.4f}")
+    checkpoint = torch.load(args.save_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    test_loss, test_accuracy = evaluate(model, loaders.test, criterion, device)
+    print(
+        f"Best validation loss: {best_loss:.6f} | test_loss={test_loss:.6f} "
+        f"| test_accuracy={test_accuracy:.4f}"
+    )
 
 
 if __name__ == "__main__":

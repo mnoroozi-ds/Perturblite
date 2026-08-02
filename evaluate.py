@@ -1,149 +1,149 @@
-"""Evaluate the AdvGAN attack success rate against the binary classifier.
+"""Evaluate a PerturbLite generator using attack success rate (ASR)."""
 
-Metrics reported
-----------------
-- **Attack Success Rate (ASR)**: fraction of originally-correct predictions
-  that are flipped to the wrong class after perturbation.
-- **Clean Accuracy**: classifier accuracy on unperturbed test images.
-- **Adversarial Accuracy**: classifier accuracy after the generator perturbs
-  the test images.
-
-Usage
------
-    python evaluate.py \\
-        --data-dir data/ \\
-        --classifier-path best_classifier.pth \\
-        --generator-path checkpoints/G_final.pth
-"""
+from __future__ import annotations
 
 import argparse
 
 import torch
 
+from attack.masks import constrain_generated_sample
 from models.classifier import BinaryClassifier
 from models.generator import Generator
-from attack.masks import build_perturbation_mask
 from utils.dataset import build_packet_dataloaders
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Evaluate the AdvGAN attack success rate."
-    )
-    parser.add_argument(
-        "--data-dir",
-        required=True,
-        help="Root data directory containing sub-folders '0' and '1'.",
-    )
-    parser.add_argument(
-        "--classifier-path",
-        required=True,
-        help="Path to the pre-trained classifier weights (.pth).",
-    )
-    parser.add_argument(
-        "--generator-path",
-        required=True,
-        help="Path to the trained Generator weights (.pth).",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-        help="Mini-batch size (default: 32).",
-    )
-    parser.add_argument(
-        "--device",
-        default=None,
-        help="Compute device: 'cuda', 'cpu', or leave empty for auto-detect.",
-    )
+    parser = argparse.ArgumentParser(description="Evaluate PerturbLite.")
+    parser.add_argument("--data", required=True, help="Path to the prepared packet CSV.")
+    parser.add_argument("--classifier-path", required=True)
+    parser.add_argument("--generator-path", required=True)
+    parser.add_argument("--label-col", default="label")
+    parser.add_argument("--partition-col", default=None)
+    parser.add_argument("--classifier-fraction", type=float, default=0.5)
+    parser.add_argument("--attack-type-col", default=None)
+    parser.add_argument("--attack-type", default=None)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--fold-index", type=int, default=0)
+    parser.add_argument("--device", default=None)
     return parser.parse_args()
+
+
+def _load_state(path: str, state_key: str, device):
+    checkpoint = torch.load(path, map_location=device)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Unsupported checkpoint format: {path}")
+    return checkpoint, checkpoint.get(state_key, checkpoint)
 
 
 def main(args: argparse.Namespace) -> None:
     device = torch.device(
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    print(f"Using device: {device}")
-
-    # Load models
-    classifier = BinaryClassifier().to(device)
-    classifier.load_state_dict(
-        torch.load(args.classifier_path, map_location=device)
+    loaders = build_packet_dataloaders(
+        args.data,
+        label_col=args.label_col,
+        batch_size=args.batch_size,
+        random_state=args.seed,
+        partition="generator",
+        partition_col=args.partition_col,
+        classifier_fraction=args.classifier_fraction,
+        folds=args.folds,
+        fold_index=args.fold_index,
+        attack_type_col=args.attack_type_col,
+        attack_type=args.attack_type,
     )
+
+    classifier_checkpoint, classifier_state = _load_state(
+        args.classifier_path, "model_state_dict", device
+    )
+    saved_classifier_features = classifier_checkpoint.get("feature_names")
+    if saved_classifier_features is not None and tuple(saved_classifier_features) != loaders.feature_names:
+        raise ValueError("Classifier checkpoint feature order does not match the CSV")
+    classifier = BinaryClassifier(input_dim=len(loaders.feature_names)).to(device)
+    classifier.load_state_dict(classifier_state)
     classifier.eval()
 
-    generator = Generator().to(device)
-    generator.load_state_dict(
-        torch.load(args.generator_path, map_location=device)
+    generator_checkpoint, generator_state = _load_state(
+        args.generator_path, "generator_state_dict", device
     )
+    required = {"feature_names", "immutable_mask", "mutable_mask", "lower_bounds", "upper_bounds"}
+    missing = required - set(generator_checkpoint)
+    if missing:
+        raise ValueError(
+            "Generator checkpoint does not include the required constraint metadata; "
+            f"missing {sorted(missing)}"
+        )
+    if tuple(generator_checkpoint["feature_names"]) != loaders.feature_names:
+        raise ValueError("Generator checkpoint feature order does not match the CSV")
+
+    generator = Generator().to(device)
+    generator.load_state_dict(generator_state)
     generator.eval()
+    immutable_mask = generator_checkpoint["immutable_mask"].to(device)
+    mutable_mask = generator_checkpoint["mutable_mask"].to(device)
+    lower_bounds = generator_checkpoint["lower_bounds"].to(device)
+    upper_bounds = generator_checkpoint["upper_bounds"].to(device)
 
-    print(f"Loaded classifier  : {args.classifier_path}")
-    print(f"Loaded generator   : {args.generator_path}")
-
-    # Data — use test split
-    _, test_loader = build_packet_dataloaders(args.data_dir, batch_size=args.batch_size)
-
-    # Perturbation mask  (1-D, shape: n_features)
-    mask = build_perturbation_mask().to(device)
-
-    # Evaluation loop
-    #
-    # ASR is defined as:
-    #
-    #   ASR = T_m / TP
-    #
-    # where:
-    #   TP  = number of samples correctly classified on clean (unperturbed) input
-    #   T_m = number of those TP samples that the adversarial perturbation causes
-    #         the model to misclassify  (i.e., originally-correct → now-wrong)
-    #
-    # Reference: equation (3) in the paper.
-
-    total   = 0
-    TP      = 0   # correctly classified on clean input
-    T_m     = 0   # TP samples successfully flipped by the attack
-    adv_correct = 0  # correctly classified on adversarial input (for reporting)
+    total = 0
+    clean_correct = 0
+    adversarial_correct = 0
+    true_positive_attacks = 0
+    successful_evasions = 0
+    malicious_count = 0
+    mutable_squared_error = 0.0
+    mutable_count = int(mutable_mask.sum().item())
 
     with torch.no_grad():
-        for pkts, labels in test_loader:
-            pkts   = pkts.to(device)                         # (batch, 1481)
-            labels = labels.float().unsqueeze(1).to(device)
-            batch_size = pkts.size(0)
+        for packets, labels in loaders.test:
+            packets = packets.to(device)
+            labels = labels.to(device)
+            malicious = labels == 1
+            generated = generator(packets.unsqueeze(1)).squeeze(1)
+            constrained = constrain_generated_sample(
+                packets,
+                generated,
+                immutable_mask,
+                mutable_mask,
+                lower_bounds,
+                upper_bounds,
+            )
+            # The generator targets malicious traffic only. Benign samples are
+            # retained unchanged when reporting whole-split accuracy.
+            crafted = torch.where(malicious.unsqueeze(1), constrained, packets)
 
-            # --- clean predictions (packet-level) ---
-            clean_preds = classifier(pkts)
-            clean_pred_labels = (clean_preds >= 0.5).int()
-            label_ints = labels.int()
-            correctly_classified = (clean_pred_labels == label_ints)   # bool mask
+            clean_labels = (classifier(packets).squeeze(1) >= 0.5).long()
+            adversarial_labels = (classifier(crafted).squeeze(1) >= 0.5).long()
+            eligible = malicious & (clean_labels == 1)
 
-            # --- generate adversarial perturbation ---
-            perturbation = generator(pkts.unsqueeze(1)).squeeze(1)  # (batch, 1481)
-            perturbation = perturbation * mask
-            perturbed    = (perturbation * pkts + pkts).clamp(0.0, 1.0)
+            total += labels.numel()
+            clean_correct += (clean_labels == labels).sum().item()
+            adversarial_correct += (adversarial_labels == labels).sum().item()
+            true_positive_attacks += eligible.sum().item()
+            successful_evasions += (eligible & (adversarial_labels == 0)).sum().item()
+            malicious_count += malicious.sum().item()
+            mutable_squared_error += (
+                ((crafted[malicious] - packets[malicious]) * mutable_mask)
+                .square()
+                .sum()
+                .item()
+            )
 
-            # --- adversarial predictions (packet-level) ---
-            adv_preds = classifier(perturbed)
-            adv_pred_labels = (adv_preds >= 0.5).int()
+    clean_accuracy = clean_correct / max(total, 1)
+    adversarial_accuracy = adversarial_correct / max(total, 1)
+    asr = successful_evasions / max(true_positive_attacks, 1)
+    mse = mutable_squared_error / max(malicious_count * mutable_count, 1)
 
-            # --- accumulate counters ---
-            TP          += correctly_classified.sum().item()
-            # T_m: was correct on clean, now wrong on adversarial
-            T_m         += (correctly_classified & (adv_pred_labels != label_ints)).sum().item()
-            adv_correct += (adv_pred_labels == label_ints).sum().item()
-            total       += batch_size
-
-    clean_acc = TP          / total if total > 0 else 0.0
-    adv_acc   = adv_correct / total if total > 0 else 0.0
-    asr       = T_m         / TP    if TP    > 0 else 0.0  # ASR = T_m / TP
-
-    print(f"\n{'=' * 40}")
-    print(f"Total test samples  : {total}")
-    print(f"TP  (clean correct) : {TP}  →  clean accuracy = {clean_acc:.4f}")
-    print(f"T_m (TP flipped)    : {T_m}")
-    print(f"Adversarial accuracy: {adv_acc:.4f}  ({adv_correct}/{total})")
-    print(f"ASR = T_m / TP      : {asr:.4f}  ({T_m}/{TP})")
-    print(f"{'=' * 40}")
+    print("\nPerturbLite evaluation")
+    print(f"Total test packets: {total}")
+    print(f"Clean accuracy: {clean_accuracy:.4f}")
+    print(f"Adversarial accuracy: {adversarial_accuracy:.4f}")
+    print(
+        "ASR (clean true-positive attacks classified benign): "
+        f"{asr:.4f} ({successful_evasions}/{true_positive_attacks})"
+    )
+    print(f"Mutable-feature MSE on malicious packets: {mse:.6f}")
 
 
 if __name__ == "__main__":

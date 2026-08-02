@@ -1,10 +1,8 @@
-"""Surrogate (binary) classifier for network flows.
+"""Surrogate binary classifier for packet-level PerturbLite features.
 
 Input shape: (batch, input_dim)  — flat feature vector per flow.
-Default input_dim = 1481 features derived from a single forward-direction
-packet after stripping routing-critical header bytes (IP checksum, TCP
-checksum, sequence/ack numbers).  See ``utils.preprocessing.flatten_for_surrogate``
-for the extraction logic.
+Default input_dim = 1481 features derived from one preprocessed forward TCP
+packet.
 
 Output: scalar in [0, 1] via Sigmoid (class 1 probability).
 
@@ -72,9 +70,7 @@ class BinaryClassifier(nn.Module):
         Parameters
         ----------
         x : Tensor  (batch, input_dim)
-            Pre-flattened feature vector.  Use
-            ``utils.preprocessing.flatten_for_surrogate`` to convert raw
-            flow images to this representation.
+            Prepared, normalized packet feature vector.
 
         Returns
         -------

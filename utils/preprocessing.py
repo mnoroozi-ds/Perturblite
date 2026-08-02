@@ -1,30 +1,24 @@
-"""Preprocessing note.
+"""Specification for the external PCAP-to-CSV preparation pipeline.
 
-Features are **pre-extracted** by the data generation pipeline: each CSV
-row already contains the 1481 feature values (immutable header bytes
-stripped).  No column stripping is performed at runtime.
-
-This module provides only the **mutable-position mask** for the Generator:
-which of the 1481 feature positions correspond to fields that can safely
-be perturbed without breaking packet validity.
-
-Mutable positions in the 1481-feature vector
----------------------------------------------
-The original byte indices (0-based within a 1501-byte packet) that are
-mutable, and their mapped indices after stripping:
-
-  Original byte 9  (IP TTL)              → feature index  7
-  Original byte 35 (TCP urgent ptr, high) → feature index 17
-  Original byte 36 (TCP urgent ptr, low)  → feature index 18
-
-Mapping formula (stripping cols 1-2, 10-25, 37-38)::
-
-  0     → 0
-  3-9   → 1-7    (col 9 / TTL → index 7)
-  26-36 → 8-18   (col 35 → 17, col 36 → 18)
-  39-1500 → 19-1480
-
-Note: if your feature extraction pipeline uses a different column order,
-update ``MUTABLE_FEATURE_POSITIONS`` in ``attack/masks.py`` accordingly.
+Model training starts from the final 1,481-feature CSV. PCAP parsing requires
+packet/flow labeling context and remains separate from the learning code. See
+``data/README.md`` for the complete preparation and schema requirements.
 """
-# No runtime functions needed — features arrive ready-to-use from CSV.
+
+MAX_RAW_PACKET_BYTES = 1594
+PREPARED_PACKET_FEATURES = 1481
+
+REMOVED_PACKET_FIELDS = (
+    "ethernet_header",
+    "ip_version",
+    "ip_differentiated_services",
+    "ip_protocol",
+    "ip_source_address",
+    "ip_destination_address",
+    "tcp_source_port",
+    "tcp_destination_port",
+    "ip_options",
+    "tcp_options",
+    "ip_checksum",
+    "tcp_checksum",
+)
